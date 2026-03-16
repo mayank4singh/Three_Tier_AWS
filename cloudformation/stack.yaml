@@ -1,0 +1,402 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Three-Tier Product Catalog - Frontend + Backend on ECS Fargate
+
+Parameters:
+
+  FrontendImage:
+    Type: String
+    Description: ECR URI for frontend image
+
+  BackendImage:
+    Type: String
+    Description: ECR URI for backend image
+
+Resources:
+
+  # ── VPC ──────────────────────────────────────────────────────
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: fullstack-vpc
+
+  # ── PUBLIC SUBNETS (Frontend ALB lives here) ─────────────────
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet2
+
+  # ── PRIVATE SUBNETS (Backend lives here) ─────────────────────
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet2
+
+  # ── INTERNET GATEWAY ─────────────────────────────────────────
+  IGW:
+    Type: AWS::EC2::InternetGateway
+
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref IGW
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ── NAT GATEWAY (private subnets pull ECR images through this)
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ── SECURITY GROUPS ──────────────────────────────────────────
+
+  # Frontend ALB - open to internet on port 80
+  FrontendALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Frontend ALB - allow internet HTTP
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # Frontend ECS - allow from Frontend ALB only
+  FrontendECSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Frontend ECS - allow from Frontend ALB
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref FrontendALBSG
+
+  # Backend ALB - allow from Frontend ECS only
+  BackendALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Backend ALB - allow from Frontend ECS
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref FrontendECSSG
+
+  # Backend ECS - allow from Backend ALB only
+  BackendECSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Backend ECS - allow from Backend ALB
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref BackendALBSG
+
+  # ── ECS CLUSTER ──────────────────────────────────────────────
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: fullstack-cluster
+
+  # ── IAM ROLE ─────────────────────────────────────────────────
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: fullstack-ecs-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # ── CLOUDWATCH LOGS ──────────────────────────────────────────
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/fullstack-backend
+      RetentionInDays: 7
+
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/fullstack-frontend
+      RetentionInDays: 7
+
+  # ── BACKEND ALB (Internal - only reachable inside VPC) ───────
+  BackendALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: fullstack-backend-alb
+      Scheme: internal
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref BackendALBSG
+
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: fullstack-backend-tg
+      Port: 5000
+      Protocol: HTTP
+      VpcId: !Ref MyVPC
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  BackendALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref BackendALB
+      Port: 5000
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  # ── BACKEND TASK DEFINITION ───────────────────────────────────
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: fullstack-backend
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref ECSExecutionRole
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Ref BackendImage
+          PortMappings:
+            - ContainerPort: 5000
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/fullstack-backend
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend
+          Essential: true
+
+  # ── BACKEND ECS SERVICE ───────────────────────────────────────
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn: BackendALBListener
+    Properties:
+      ServiceName: fullstack-backend
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref BackendECSSG
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: 5000
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  # ── FRONTEND ALB (Public - internet facing) ───────────────────
+  FrontendALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: fullstack-frontend-alb
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref FrontendALBSG
+
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: fullstack-frontend-tg
+      Port: 3000
+      Protocol: HTTP
+      VpcId: !Ref MyVPC
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  FrontendALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref FrontendALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+
+  # ── FRONTEND TASK DEFINITION ──────────────────────────────────
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: fullstack-frontend
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref ECSExecutionRole
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !Ref FrontendImage
+          PortMappings:
+            - ContainerPort: 3000
+          Environment:
+            - Name: BACKEND_URL
+              Value: !Sub "http://${BackendALB.DNSName}:5000"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/fullstack-frontend
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: frontend
+          Essential: true
+
+  # ── FRONTEND ECS SERVICE ──────────────────────────────────────
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn: FrontendALBListener
+    Properties:
+      ServiceName: fullstack-frontend
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref FrontendECSSG
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - ContainerName: frontend
+          ContainerPort: 3000
+          TargetGroupArn: !Ref FrontendTargetGroup
+
+# ── OUTPUTS ───────────────────────────────────────────────────
+Outputs:
+
+  AppURL:
+    Description: Open this in your browser - your live app
+    Value: !Sub "http://${FrontendALB.DNSName}"
+
+  BackendURL:
+    Description: Internal backend ALB URL (used by frontend)
+    Value: !Sub "http://${BackendALB.DNSName}:5000"

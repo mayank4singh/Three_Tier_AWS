@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Least-privilege IAM role and instance profile for the Jenkins slave EC2.
+  The slave needs to: authenticate to ECR, push/pull images, register new ECS
+  task-definition revisions, update ECS services, and pass the existing ECS
+  execution role to ECS.  No other permissions are granted.
+
+Parameters:
+
+  ECSExecutionRoleArn:
+    Type: String
+    Description: >
+      ARN of the ECS task-execution role that the slave must be allowed to
+      pass to ECS when registering task definitions
+      (e.g. arn:aws:iam::123456789012:role/fullstack-ecs-role).
+
+  AWSRegion:
+    Type: String
+    Default: us-east-1
+    Description: >
+      AWS region where ECR repositories and ECS services are deployed.
+      IAM resource ARNs are scoped to this region for least-privilege access.
+
+Resources:
+
+  # ── IAM Policy: least-privilege actions required by the pipeline ──────────
+  JenkinsSlavePipelinePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: JenkinsSlave-ECS-ECR-Pipeline
+      Description: Allows the Jenkins slave to build/push to ECR and deploy to ECS
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+
+          # ECR login token (account-wide, no resource restriction possible)
+          - Sid: ECRGetAuthToken
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+            Resource: '*'
+
+          # ECR image push/pull on the two application repositories only
+          - Sid: ECRImageOperations
+            Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:PutImage
+            Resource:
+              - !Sub 'arn:aws:ecr:${AWSRegion}:${AWS::AccountId}:repository/fullstack-frontend'
+              - !Sub 'arn:aws:ecr:${AWSRegion}:${AWS::AccountId}:repository/fullstack-backend'
+
+          # ECS: read current task definitions and register new revisions
+          - Sid: ECSTaskDefinitions
+            Effect: Allow
+            Action:
+              - ecs:DescribeTaskDefinition
+              - ecs:RegisterTaskDefinition
+            Resource: '*'
+
+          # ECS: update the two named services and monitor stability
+          - Sid: ECSServices
+            Effect: Allow
+            Action:
+              - ecs:UpdateService
+              - ecs:DescribeServices
+            Resource:
+              - !Sub 'arn:aws:ecs:${AWSRegion}:${AWS::AccountId}:service/fullstack-cluster/fullstack-frontend'
+              - !Sub 'arn:aws:ecs:${AWSRegion}:${AWS::AccountId}:service/fullstack-cluster/fullstack-backend'
+
+          # IAM PassRole: slave may only pass the specific ECS execution role
+          - Sid: PassECSExecutionRole
+            Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource: !Ref ECSExecutionRoleArn
+            Condition:
+              StringEquals:
+                iam:PassedToService: ecs-tasks.amazonaws.com
+
+          # STS: retrieve account ID at pipeline start
+          - Sid: STSGetCallerIdentity
+            Effect: Allow
+            Action:
+              - sts:GetCallerIdentity
+            Resource: '*'
+
+  # ── IAM Role assumed by the slave EC2 instance ────────────────────────────
+  JenkinsSlaveRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: JenkinsSlave-Role
+      Description: IAM role for the Jenkins slave EC2 - least privilege for CI/CD
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref JenkinsSlavePipelinePolicy
+
+  # ── EC2 Instance Profile (attach this to the slave EC2) ───────────────────
+  JenkinsSlaveInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: JenkinsSlave-InstanceProfile
+      Roles:
+        - !Ref JenkinsSlaveRole
+
+Outputs:
+
+  JenkinsSlaveRoleArn:
+    Description: ARN of the Jenkins slave IAM role
+    Value: !GetAtt JenkinsSlaveRole.Arn
+
+  JenkinsSlaveInstanceProfileArn:
+    Description: ARN of the instance profile - attach this to the slave EC2
+    Value: !GetAtt JenkinsSlaveInstanceProfile.Arn
+
+  JenkinsSlaveInstanceProfileName:
+    Description: Name of the instance profile - use when launching the slave EC2
+    Value: !Ref JenkinsSlaveInstanceProfile

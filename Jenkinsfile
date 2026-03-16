@@ -4,7 +4,7 @@
 
 pipeline {
 
-  agent { label 'jenkins-slave' }
+  agent any
 
   // ── Push-based trigger (configure the matching GitHub webhook in your repo) ──
   triggers {
